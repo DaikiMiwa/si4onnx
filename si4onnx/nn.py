@@ -1,11 +1,14 @@
 import numpy as np
 import torch
-from onnx import ModelProto, numpy_helper
+from onnx import ModelProto, numpy_helper, helper
 from .utils import to_torch_tensor
 from .layers import (
     Relu,
     LeakyRelu,
     Sigmoid,
+    HardSigmoid,
+    Clip,
+    HardTanh,
     Conv,
     Gemm,
     MaxPool,
@@ -70,11 +73,17 @@ class NN(torch.nn.Module):
         self.is_memoization_initialized = True
         self.output_name_set = set(output.name for output in self.model.graph.output)
 
+        # Replace intermediate Sigmoid/Tanh with hard variants (skip graph outputs)
+        self._harden_activations()
+
         # Available layers
         self.layers = {
             "Relu": Relu,
             "LeakyRelu": LeakyRelu,
             "Sigmoid": Sigmoid,
+            "HardSigmoid": HardSigmoid,
+            "HardTanh": HardTanh,
+            "Clip": Clip,
             "Conv": Conv,
             "Gemm": Gemm,
             "MaxPool": MaxPool,
@@ -118,6 +127,27 @@ class NN(torch.nn.Module):
             return a + b * z
         else:
             return a  # constant variable is equal to a
+
+    def _harden_activations(self) -> None:
+        """Replace intermediate Sigmoid/Tanh with HardSigmoid/HardTanh (skip graph outputs)."""
+        output_names = self.output_name_set
+        for node in self.model.graph.node:
+            # skip if this node directly produces a graph output
+            if any(out in output_names for out in node.output):
+                continue
+            if node.op_type == "Sigmoid":
+                node.op_type = "HardSigmoid"
+                # Ensure alpha/beta attributes if absent (use PyTorch HardSigmoid defaults ~ 1/6, 0.5)
+                if not any(attr.name == "alpha" for attr in node.attribute):
+                    node.attribute.append(helper.make_attribute("alpha", 1.0 / 6.0))
+                if not any(attr.name == "beta" for attr in node.attribute):
+                    node.attribute.append(helper.make_attribute("beta", 0.5))
+            elif node.op_type == "Tanh":
+                node.op_type = "HardTanh"
+                if not any(attr.name == "min" for attr in node.attribute):
+                    node.attribute.append(helper.make_attribute("min", -1.0))
+                if not any(attr.name == "max" for attr in node.attribute):
+                    node.attribute.append(helper.make_attribute("max", 1.0))
 
     def _search_start_node(self, z, output, output_si):
         """Search the start node for the forward_si method.
@@ -330,12 +360,20 @@ class NN(torch.nn.Module):
                     raise NotImplementedError(f"Layer {op_type} is not supported.")
 
                 if isinstance(a, torch.Tensor) or op_type == "Constant":
-                    assert l < u
+                    if not (l < u):
+                        raise AssertionError(
+                            f"Invalid interval (scalar) at node '{node.name}' "
+                            f"op='{op_type}': l={l}, u={u}, z={z}"
+                        )
                     node_output[node.output[0]] = self._calculate_output_x(a, b, z)
                     node_output_si[node.output[0]] = (a, b, l, u)
                 else:
                     for i, output_name in enumerate(node.output):
-                        assert l[i] < u[i]
+                        if not (l[i] < u[i]):
+                            raise AssertionError(
+                                f"Invalid interval (index {i}) at node '{node.name}' "
+                                f"op='{op_type}': l={l[i]}, u={u[i]}, z={z}"
+                            )
                         node_output[output_name] = self._calculate_output_x(
                             a[i], b[i], z
                         )

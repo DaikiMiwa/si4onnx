@@ -122,6 +122,226 @@ class Sigmoid(Layer):
         return output_a, output_b, l, u
 
 
+class HardSigmoid(Layer):
+    """
+    Placeholder for HardSigmoid (piecewise linear sigmoid).
+
+    The actual forward / forward_si should clip(alpha * x + beta, 0, 1).
+    """
+
+    def __init__(self, inputs, node):
+        super().__init__(inputs, node)
+        self.alpha = self.attribute["alpha"].f if "alpha" in self.attribute else 0.2
+        self.beta = self.attribute["beta"].f if "beta" in self.attribute else 0.5
+
+        self.lower_bound = -self.beta / self.alpha
+        self.upper_bound = (1.0 - self.beta) / self.alpha
+
+    def forward(self, x):
+        # ONNX / PyTorch の定義に合わせ、clip(alpha * x + beta, 0, 1) を使う
+        return torch.clamp(self.alpha * x + self.beta, min=0.0, max=1.0)
+
+    def forward_si(self, a, b, l, u, z):
+        if b is None:
+            output_a = torch.clamp(self.alpha * a + self.beta, min=0.0, max=1.0)
+            output_b = None
+            return output_a, output_b, l, u
+
+        a1 = self.alpha * a + self.beta
+        b1 = self.alpha * b
+
+        constraints_a = []
+        constraints_b = []
+
+        x1 = a1 + b1 * z
+
+        # Lower saturation: a1 + b1*z <= 0  <=> -(a1 + b1*z) >= 0
+        mask_lower = x1 <= 0
+        if mask_lower.any():
+            constraints_a.append((-a1)[mask_lower])
+            constraints_b.append((-b1)[mask_lower])
+
+        # Upper saturation: a1 + b1*z >= 1  <=> (a1 - 1) + b1*z >= 0
+        mask_upper = x1 >= 1
+        if mask_upper.any():
+            constraints_a.append((a1 - 1)[mask_upper])
+            constraints_b.append(b1[mask_upper])
+
+        # Linear region: 0 < a1 + b1*z < 1
+        mask_middle = (~mask_lower) & (~mask_upper)
+        if mask_middle.any():
+            constraints_a.append(a1[mask_middle])        # >0
+            constraints_b.append(b1[mask_middle])
+            constraints_a.append((1 - a1)[mask_middle])  # <1 => (1 - a1) - b1*z > 0
+            constraints_b.append((-b1)[mask_middle])
+
+        if constraints_a:
+            a_cat = torch.cat(constraints_a)
+            b_cat = torch.cat(constraints_b)
+            temp_l, temp_u = truncated_interval(a_cat, b_cat)
+            l = torch.max(l, temp_l)
+            u = torch.min(u, temp_u)
+
+        zero = torch.tensor(0.0, dtype=a.dtype, device=a.device)
+        one = torch.tensor(1.0, dtype=a.dtype, device=a.device)
+
+        output_a = torch.where(mask_lower, zero, torch.where(mask_upper, one, a1))
+        output_b = torch.where(mask_lower | mask_upper, zero, b1)
+
+        return output_a, output_b, l, u
+
+
+class Clip(Layer):
+    """
+    Clip operator: clamp input to [min, max]. Handles optional min/max inputs or attributes.
+    """
+
+    def __init__(self, inputs, node):
+        super().__init__(inputs, node)
+        self.min = None
+        self.max = None
+
+        # Optional inputs (second: min, third: max), skipping empty strings.
+        input_iter = iter(inputs)
+        for idx, name in enumerate(node.input):
+            if name == "":
+                continue
+            tensor = next(input_iter)
+            if idx == 1:
+                self.min = tensor.double()
+            elif idx == 2:
+                self.max = tensor.double()
+
+        if self.min is None and "min" in self.attribute:
+            self.min = torch.tensor(self.attribute["min"].f).double()
+        if self.max is None and "max" in self.attribute:
+            self.max = torch.tensor(self.attribute["max"].f).double()
+
+    def _bound(self, bound, x):
+        if isinstance(bound, torch.Tensor):
+            return bound.to(dtype=x.dtype, device=x.device)
+        if bound is not None:
+            return torch.tensor(bound, dtype=x.dtype, device=x.device)
+        return None
+
+    def forward(self, x):
+        clamp_min = self._bound(self.min, x)
+        clamp_max = self._bound(self.max, x)
+        if clamp_min is not None and clamp_max is not None:
+            return torch.clamp(x, min=clamp_min, max=clamp_max)
+        if clamp_min is not None:
+            return torch.clamp(x, min=clamp_min)
+        if clamp_max is not None:
+            return torch.clamp(x, max=clamp_max)
+        return x
+
+    def forward_si(self, a, b, l, u, z):
+        if b is None:
+            return self.forward(a), None, l, u
+
+        x = a + b * z
+        has_min = self.min is not None
+        has_max = self.max is not None
+
+        min_tensor = self._bound(self.min, a) if has_min else torch.tensor(-torch.inf, dtype=a.dtype, device=a.device)
+        max_tensor = self._bound(self.max, a) if has_max else torch.tensor(torch.inf, dtype=a.dtype, device=a.device)
+
+        mask_lower = (x <= min_tensor) if has_min else torch.zeros_like(x, dtype=torch.bool)
+        mask_upper = (x >= max_tensor) if has_max else torch.zeros_like(x, dtype=torch.bool)
+        mask_middle = (~mask_lower) & (~mask_upper)
+
+        constraints_a = []
+        constraints_b = []
+
+        if has_min:
+            if torch.any(mask_lower):
+                constraints_a.append((min_tensor - a)[mask_lower])
+                constraints_b.append((-b)[mask_lower])
+            if torch.any(mask_middle):
+                constraints_a.append((a - min_tensor)[mask_middle])
+                constraints_b.append(b[mask_middle])
+
+        if has_max:
+            if torch.any(mask_upper):
+                constraints_a.append((a - max_tensor)[mask_upper])
+                constraints_b.append(b[mask_upper])
+            if torch.any(mask_middle):
+                constraints_a.append((max_tensor - a)[mask_middle])
+                constraints_b.append((-b)[mask_middle])
+
+        if constraints_a:
+            a_cat = torch.cat(constraints_a)
+            b_cat = torch.cat(constraints_b)
+            temp_l, temp_u = truncated_interval(a_cat, b_cat)
+            l = torch.max(l, temp_l)
+            u = torch.min(u, temp_u)
+
+        zero = torch.tensor(0.0, dtype=b.dtype, device=b.device)
+        output_a = torch.where(mask_lower, min_tensor, torch.where(mask_upper, max_tensor, a))
+        output_b = torch.where(mask_lower | mask_upper, zero, b)
+        return output_a, output_b, l, u
+
+
+class HardTanh(Layer):
+    """
+    HardTanh activation (piecewise linear clamp) with optional min/max attributes.
+    """
+
+    def __init__(self, inputs, node):
+        super().__init__(inputs, node)
+        self.min = torch.tensor(self.attribute["min"].f).double() if "min" in self.attribute else torch.tensor(-1.0).double()
+        self.max = torch.tensor(self.attribute["max"].f).double() if "max" in self.attribute else torch.tensor(1.0).double()
+
+    def _bound(self, bound, x):
+        if isinstance(bound, torch.Tensor):
+            return bound.to(dtype=x.dtype, device=x.device)
+        return torch.tensor(bound, dtype=x.dtype, device=x.device)
+
+    def forward(self, x):
+        clamp_min = self._bound(self.min, x)
+        clamp_max = self._bound(self.max, x)
+        return torch.clamp(x, min=clamp_min, max=clamp_max)
+
+    def forward_si(self, a, b, l, u, z):
+        if b is None:
+            return self.forward(a), None, l, u
+
+        x = a + b * z
+        min_tensor = self._bound(self.min, a)
+        max_tensor = self._bound(self.max, a)
+
+        mask_lower = x <= min_tensor
+        mask_upper = x >= max_tensor
+        mask_middle = (~mask_lower) & (~mask_upper)
+
+        constraints_a = []
+        constraints_b = []
+
+        # Lower: a + b*z <= min
+        constraints_a.append((min_tensor - a)[mask_lower])
+        constraints_b.append((-b)[mask_lower])
+        # Upper: a + b*z >= max
+        constraints_a.append((a - max_tensor)[mask_upper])
+        constraints_b.append(b[mask_upper])
+        # Middle: min < a + b*z < max
+        constraints_a.append((a - min_tensor)[mask_middle])
+        constraints_b.append(b[mask_middle])
+        constraints_a.append((max_tensor - a)[mask_middle])
+        constraints_b.append((-b)[mask_middle])
+
+        a_cat = torch.cat([c for c in constraints_a if c.numel() > 0]) if constraints_a else torch.tensor([], dtype=a.dtype, device=a.device)
+        b_cat = torch.cat([c for c in constraints_b if c.numel() > 0]) if constraints_b else torch.tensor([], dtype=a.dtype, device=a.device)
+        if a_cat.numel() > 0:
+            temp_l, temp_u = truncated_interval(a_cat, b_cat)
+            l = torch.max(l, temp_l)
+            u = torch.min(u, temp_u)
+
+        zero = torch.tensor(0.0, dtype=b.dtype, device=b.device)
+        output_a = torch.where(mask_lower, min_tensor, torch.where(mask_upper, max_tensor, a))
+        output_b = torch.where(mask_lower | mask_upper, zero, b)
+        return output_a, output_b, l, u
+
+
 class Conv(Layer):
     def __init__(self, inputs, node):
         super().__init__(inputs, node)
